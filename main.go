@@ -205,9 +205,10 @@ func run() int {
 		w.Write([]byte("Healthy"))
 	})
 	http.HandleFunc(path.Join(*routePrefix, "/probe"), func(w http.ResponseWriter, r *http.Request) {
-		sc.Lock()
-		conf := sc.C
-		sc.Unlock()
+		// Snapshot the active config pointer: a reload happening while this
+		// probe is in flight swaps sc.C atomically but never mutates the
+		// pointer we are holding.
+		conf := sc.GetConfig()
 		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, scrapeLoggerConfig)
 	})
 	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, _ *http.Request) {
@@ -278,9 +279,7 @@ func run() int {
 	})
 
 	http.HandleFunc(path.Join(*routePrefix, "/config"), func(w http.ResponseWriter, _ *http.Request) {
-		sc.RLock()
-		c, err := yaml.Marshal(sc.C)
-		sc.RUnlock()
+		c, err := yaml.Marshal(sc.GetConfig())
 		if err != nil {
 			logger.Warn("Error marshalling configuration", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)

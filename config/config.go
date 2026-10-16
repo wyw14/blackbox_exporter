@@ -98,6 +98,7 @@ type Config struct {
 type SafeConfig struct {
 	sync.RWMutex
 	C                   *Config
+	rules               *Registry
 	configReloadSuccess prometheus.Gauge
 	configReloadSeconds prometheus.Gauge
 	configChecksum      string
@@ -115,11 +116,47 @@ func NewSafeConfig(reg prometheus.Registerer) *SafeConfig {
 		Name:      "config_last_reload_success_timestamp_seconds",
 		Help:      "Timestamp of the last successful configuration reload.",
 	})
-	return &SafeConfig{C: &Config{}, configReloadSuccess: configReloadSuccess, configReloadSeconds: configReloadSeconds}
+	return &SafeConfig{
+		C:                   &Config{},
+		rules:               NewDefaultRegistry(nil),
+		configReloadSuccess: configReloadSuccess,
+		configReloadSeconds: configReloadSeconds,
+	}
 }
 
+// Registry returns the pluggable validation rule registry. Rules can be
+// registered, replaced or removed at runtime; in-flight requests keep using
+// the rule snapshot they started with.
+func (sc *SafeConfig) Registry() *Registry {
+	return sc.rules
+}
+
+// SetRegistry replaces the validation rule registry used by subsequent
+// config loads. It is mainly useful for tests and embedders.
+func (sc *SafeConfig) SetRegistry(r *Registry) {
+	if r == nil {
+		return
+	}
+	sc.Lock()
+	sc.rules = r
+	sc.Unlock()
+}
+
+// GetConfig returns an immutable snapshot pointer of the active config.
+// Callers may retain the pointer for the lifetime of a request: a later
+// reload atomically swaps the active config but never mutates the returned
+// snapshot, so in-flight requests keep seeing a stable configuration.
+func (sc *SafeConfig) GetConfig() *Config {
+	sc.RLock()
+	defer sc.RUnlock()
+	return sc.C
+}
+
+// ReloadConfig reads, validates and, only on success, atomically installs the
+// configuration from confFile. Parsing errors or error-severity validation
+// diagnostics leave the previously active configuration untouched (rollback);
+// warning-severity diagnostics are logged but do not block the reload.
 func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err error) {
-	c := &Config{}
 	defer func() {
 		if err != nil {
 			sc.configReloadSuccess.Set(0)
@@ -129,8 +166,7 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 		}
 	}()
 
-	var currentConfigChecksum string
-	currentConfigChecksum, err = GenerateChecksum(confFile)
+	currentConfigChecksum, err := GenerateChecksum(confFile)
 	if err != nil {
 		return fmt.Errorf("failed to generate initial checksum for configuration file: %s", err)
 	}
@@ -144,16 +180,50 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 		logger.Info("Configuration file change detected, reloading the configuration.")
 	}
 
+	// Build and validate the candidate config without touching the active
+	// snapshot. Only once every check passes is sc.C swapped atomically.
+	c, diags, err := sc.loadCandidateConfig(confFile, logger)
+	if err != nil {
+		return err
+	}
+	for _, d := range diags.Warnings() {
+		if logger != nil {
+			logger.Warn("Configuration validation warning", "rule", d.Rule, "module", d.Module, "field", d.Field, "message", d.Message)
+		}
+	}
+
+	sc.Lock()
+	sc.C = c
+	sc.configChecksum = currentConfigChecksum
+	sc.Unlock()
+
+	return nil
+}
+
+// DryRunConfig loads and validates confFile against the active rule set
+// without installing it and without changing the reload metrics. It returns
+// the collected diagnostics (including warnings) so callers can inspect them.
+func (sc *SafeConfig) DryRunConfig(confFile string, logger *slog.Logger) (Diagnostics, error) {
+	_, diags, err := sc.loadCandidateConfig(confFile, logger)
+	return diags, err
+}
+
+// loadCandidateConfig parses confFile into a fresh Config and runs the active
+// validation rules against it. It never mutates the active configuration, so
+// any error here effectively rolls the reload back to the current snapshot.
+func (sc *SafeConfig) loadCandidateConfig(confFile string, logger *slog.Logger) (*Config, Diagnostics, error) {
+	c := &Config{}
+
 	yamlReader, err := os.Open(confFile)
 	if err != nil {
-		return fmt.Errorf("error reading config file: %s", err)
+		return nil, nil, fmt.Errorf("error reading config file: %s", err)
 	}
 	defer yamlReader.Close()
 	decoder := yaml.NewDecoder(yamlReader)
 	decoder.KnownFields(true)
 
-	if err = decoder.Decode(c); err != nil {
-		return fmt.Errorf("error parsing config file: %s", err)
+	if err := decoder.Decode(c); err != nil {
+		return nil, nil, fmt.Errorf("error parsing config file: %s", err)
 	}
 
 	for name, module := range c.Modules {
@@ -172,12 +242,11 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 		}
 	}
 
-	sc.Lock()
-	sc.C = c
-	sc.configChecksum = currentConfigChecksum
-	sc.Unlock()
-
-	return nil
+	diags, err := sc.rules.Validate(c)
+	if err != nil {
+		return nil, diags, fmt.Errorf("invalid configuration:\n%w", err)
+	}
+	return c, diags, nil
 }
 
 // CELProgram encapsulates a cel.Program and makes it YAML marshalable.
