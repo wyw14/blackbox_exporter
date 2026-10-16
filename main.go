@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html"
@@ -53,8 +54,8 @@ var (
 	timeoutOffset      = kingpin.Flag("timeout-offset", "Offset to subtract from timeout in seconds.").Default("0.5").Float64()
 	configCheck        = kingpin.Flag("config.check", "If true validate the config file and then exit.").Default().Bool()
 	logLevelProber     = kingpin.Flag("log.prober", "Log level for probe request logs. One of: [debug, info, warn, error]. Please see the section `Controlling log level for probe logs` in the project README for more information.").Default("info").String()
-	enableAutoReload   = kingpin.Flag("config.enable-auto-reload", "When enabled, Blackbox exporter will automatically reload its configuration file at a specified interval. The interval is defined by the `--config.auto-reload-interval` flag, which defaults to `30s`").Default().Bool()
-	autoReloadInterval = kingpin.Flag("config.auto-reload-interval", "Specifies the interval in seconds for checking and automatically reloading configuration file upon detecting changes.").Default("30").Uint()
+	enableAutoReload   = kingpin.Flag("config.enable-auto-reload", "When enabled, Blackbox exporter watches its configuration file and automatically reloads it as soon as it changes. A periodic check every `--config.auto-reload-interval` seconds is used as a fallback for filesystems without change notifications.").Default().Bool()
+	autoReloadInterval = kingpin.Flag("config.auto-reload-interval", "Specifies the interval in seconds for the fallback periodic check of the configuration file when `--config.enable-auto-reload` is enabled.").Default("30").Uint()
 	historyLimit       = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
 	externalURL        = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
 	routePrefix        = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
@@ -143,6 +144,16 @@ func run() int {
 	hup := make(chan os.Signal, 1)
 	reloadCh := make(chan chan error)
 	signal.Notify(hup, syscall.SIGHUP)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if *enableAutoReload {
+		// The watcher reloads immediately on file system events and
+		// falls back to a periodic checksum check. All reload triggers
+		// (watcher, SIGHUP, HTTP) are serialized inside SafeConfig.
+		if err := sc.WatchConfig(ctx, *configFile, time.Duration(*autoReloadInterval)*time.Second, logger); err != nil {
+			logger.Error("Error starting configuration file watcher", "err", err)
+		}
+	}
 	go func() {
 		for {
 			select {
@@ -160,15 +171,6 @@ func run() int {
 					logger.Info("Reloaded config file")
 					rc <- nil
 				}
-			case <-time.Tick(time.Duration(*autoReloadInterval) * time.Second):
-				if !*enableAutoReload {
-					continue
-				}
-				if err := sc.ReloadConfig(*configFile, logger); err != nil {
-					logger.Error("Error reloading config", "err", err)
-					continue
-				}
-				logger.Info("Reloaded config file")
 			}
 		}
 	}()
@@ -205,9 +207,11 @@ func run() int {
 		w.Write([]byte("Healthy"))
 	})
 	http.HandleFunc(path.Join(*routePrefix, "/probe"), func(w http.ResponseWriter, r *http.Request) {
-		sc.Lock()
-		conf := sc.C
-		sc.Unlock()
+		// Grab a snapshot of the current configuration. The snapshot is
+		// never mutated by a reload, so this probe runs to completion
+		// with the modules it started with even if modules are changed
+		// or deleted by a concurrent reload.
+		conf := sc.GetConfig()
 		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, scrapeLoggerConfig)
 	})
 	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, _ *http.Request) {

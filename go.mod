@@ -19,6 +19,10 @@ require (
 	google.golang.org/grpc v1.84.0
 )
 
+require github.com/fsnotify/fsnotify v1.10.1
+
+require github.com/kylelemons/godebug v1.1.0 // indirect
+
 require (
 	cel.dev/expr v0.25.2 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect

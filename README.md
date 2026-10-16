@@ -172,8 +172,7 @@ Blackbox exporter can reload its configuration file at runtime. If the new confi
 A configuration reload is triggered by sending a `SIGHUP` to the Blackbox exporter process or by sending a HTTP POST request to the `/-/reload` endpoint.
 
 Blackbox exporter also supports automatic configuration reloading. You can enable this feature using the `--config.enable-auto-reload` flag. 
-When enabled, the exporter will automatically check for changes to its configuration file at a specified interval in seconds. 
-The interval can be customized with the `--config.auto-reload-interval` flag, which is set to 30 (which is 30 seconds) by default.
+When enabled, the exporter watches its configuration file and reloads it immediately whenever it changes, including atomic saves that replace the file via a rename. A periodic check, customized with the `--config.auto-reload-interval` flag (30 seconds by default), is used as a fallback for filesystems that do not deliver file change notifications. If a changed configuration is not well-formed, the reload fails and the previously active configuration keeps serving probes until a valid configuration is reloaded.
 
 To view all available command-line flags, run `./blackbox_exporter -h`.
 

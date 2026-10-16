@@ -14,6 +14,9 @@
 package config
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -101,6 +104,11 @@ type SafeConfig struct {
 	configReloadSuccess prometheus.Gauge
 	configReloadSeconds prometheus.Gauge
 	configChecksum      string
+	// reloadMu serializes reload attempts coming from different sources
+	// (SIGHUP, the HTTP /-/reload endpoint, the file watcher and the
+	// periodic poller). It must not be held while probing: probes only
+	// take the RWMutex long enough to grab a configuration snapshot.
+	reloadMu sync.Mutex
 }
 
 func NewSafeConfig(reg prometheus.Registerer) *SafeConfig {
@@ -118,7 +126,23 @@ func NewSafeConfig(reg prometheus.Registerer) *SafeConfig {
 	return &SafeConfig{C: &Config{}, configReloadSuccess: configReloadSuccess, configReloadSeconds: configReloadSeconds}
 }
 
+// GetConfig returns the currently active configuration. The returned
+// pointer must be treated as read-only: a reload atomically replaces it
+// with a brand new *Config instead of mutating the active one. Probes use
+// the snapshot they received at start time, so a reload (including one
+// that deletes modules) never affects probes that are already running.
+func (sc *SafeConfig) GetConfig() *Config {
+	sc.RLock()
+	defer sc.RUnlock()
+	return sc.C
+}
+
 func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err error) {
+	// Serialize reloads so that concurrent triggers cannot interleave a
+	// checksum comparison with another reload's swap.
+	sc.reloadMu.Lock()
+	defer sc.reloadMu.Unlock()
+
 	c := &Config{}
 	defer func() {
 		if err != nil {
@@ -129,12 +153,21 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 		}
 	}()
 
-	var currentConfigChecksum string
-	currentConfigChecksum, err = GenerateChecksum(confFile)
+	// Read the file once. The checksum and the parsed configuration must
+	// describe the exact same bytes, otherwise a file rewritten between
+	// two reads could be published under the wrong checksum and the next
+	// reload would skip it.
+	configBytes, err := os.ReadFile(confFile)
 	if err != nil {
-		return fmt.Errorf("failed to generate initial checksum for configuration file: %s", err)
+		return fmt.Errorf("error reading config file: %s", err)
 	}
-	if currentConfigChecksum == sc.configChecksum {
+
+	newChecksum := checksum(configBytes)
+
+	sc.RLock()
+	currentChecksum := sc.configChecksum
+	sc.RUnlock()
+	if newChecksum == currentChecksum {
 		if logger != nil {
 			logger.Info("Configuration checksum check passed. No changes detected.")
 		}
@@ -144,12 +177,11 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 		logger.Info("Configuration file change detected, reloading the configuration.")
 	}
 
-	yamlReader, err := os.Open(confFile)
-	if err != nil {
-		return fmt.Errorf("error reading config file: %s", err)
-	}
-	defer yamlReader.Close()
-	decoder := yaml.NewDecoder(yamlReader)
+	// Parse and validate the new configuration into a fresh object. The
+	// active configuration is only touched once parsing has fully
+	// succeeded, so an invalid or half-written file never replaces the
+	// configuration that is currently serving probes.
+	decoder := yaml.NewDecoder(bytes.NewReader(configBytes))
 	decoder.KnownFields(true)
 
 	if err = decoder.Decode(c); err != nil {
@@ -172,12 +204,21 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 		}
 	}
 
+	// Atomic publication. From this point on new probes see the new
+	// configuration (with any modules deleted), while probes already in
+	// flight keep using the previous snapshot referenced by their handler.
 	sc.Lock()
 	sc.C = c
-	sc.configChecksum = currentConfigChecksum
+	sc.configChecksum = newChecksum
 	sc.Unlock()
 
 	return nil
+}
+
+// checksum returns the hex-encoded SHA-256 digest of data.
+func checksum(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
 }
 
 // CELProgram encapsulates a cel.Program and makes it YAML marshalable.
