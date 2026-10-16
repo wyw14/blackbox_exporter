@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"maps"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -42,6 +43,7 @@ import (
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/prometheus/blackbox_exporter/batch"
 	"github.com/prometheus/blackbox_exporter/config"
 	"github.com/prometheus/blackbox_exporter/prober"
 )
@@ -56,6 +58,7 @@ var (
 	enableAutoReload   = kingpin.Flag("config.enable-auto-reload", "When enabled, Blackbox exporter will automatically reload its configuration file at a specified interval. The interval is defined by the `--config.auto-reload-interval` flag, which defaults to `30s`").Default().Bool()
 	autoReloadInterval = kingpin.Flag("config.auto-reload-interval", "Specifies the interval in seconds for checking and automatically reloading configuration file upon detecting changes.").Default("30").Uint()
 	historyLimit       = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
+	batchStateFile     = kingpin.Flag("batch.state-file", "Path to a file in which bulk import/export jobs are journaled so interrupted batches resume after a restart. Disabled when empty.").Default("").String()
 	externalURL        = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
 	routePrefix        = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
 	toolkitFlags       = webflag.AddFlags(kingpin.CommandLine, ":9115")
@@ -139,6 +142,17 @@ func run() int {
 		*routePrefix = *routePrefix + "/"
 	}
 	logger.Debug(*routePrefix)
+
+	batchManager, err := batch.NewManager(
+		&safeConfigStore{sc: sc},
+		batch.WithLogger(logger),
+		batch.WithStateFile(*batchStateFile),
+	)
+	if err != nil {
+		logger.Error("Error initializing batch import/export API", "err", err)
+		return 1
+	}
+	defer batchManager.Close()
 
 	hup := make(chan os.Signal, 1)
 	reloadCh := make(chan chan error)
@@ -290,6 +304,9 @@ func run() int {
 		w.Write(c)
 	})
 
+	batchAPIPrefix := path.Join(*routePrefix, "api/v1/batch")
+	http.Handle(batchAPIPrefix+"/", http.StripPrefix(batchAPIPrefix, batchManager.Handler()))
+
 	srv := &http.Server{}
 	srvc := make(chan struct{})
 	term := make(chan os.Signal, 1)
@@ -349,4 +366,44 @@ func computeExternalURL(u, listenAddr string) (*url.URL, error) {
 	eu.Path = ppref
 
 	return eu, nil
+}
+
+// safeConfigStore adapts SafeConfig to the batch.ModuleStore interface.
+// Writes are copy-on-write and swapped under the config lock, so readers
+// serving /probe never observe a partially modified modules map.
+type safeConfigStore struct {
+	sc *config.SafeConfig
+}
+
+func (s *safeConfigStore) Has(name string) bool {
+	s.sc.RLock()
+	defer s.sc.RUnlock()
+	_, ok := s.sc.C.Modules[name]
+	return ok
+}
+
+func (s *safeConfigStore) Get(name string) (config.Module, bool) {
+	s.sc.RLock()
+	defer s.sc.RUnlock()
+	module, ok := s.sc.C.Modules[name]
+	return module, ok
+}
+
+func (s *safeConfigStore) Put(name string, module config.Module) {
+	s.sc.Lock()
+	defer s.sc.Unlock()
+	modules := make(map[string]config.Module, len(s.sc.C.Modules)+1)
+	maps.Copy(modules, s.sc.C.Modules)
+	modules[name] = module
+	s.sc.C = &config.Config{Modules: modules}
+}
+
+func (s *safeConfigStore) List() []string {
+	s.sc.RLock()
+	defer s.sc.RUnlock()
+	names := make([]string, 0, len(s.sc.C.Modules))
+	for name := range s.sc.C.Modules {
+		names = append(names, name)
+	}
+	return names
 }
