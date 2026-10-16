@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/prometheus/blackbox_exporter/tracing"
 )
 
 var protocolToGauge = map[string]float64{
@@ -120,7 +122,13 @@ func chooseProtocol(ctx context.Context, IPProtocol string, fallbackIPProtocol b
 		return nil, 0.0, fmt.Errorf("unable to find ip; no fallback")
 	}
 
-	// Use fallback ip protocol.
+	// Use fallback ip protocol. This is the second resolution attempt of the
+	// same operation: the operation ID (carried by the logger) is unchanged,
+	// only the attempt counter advances so logs from both attempts aggregate
+	// under one operation.
+	ctx = tracing.WithAttempt(ctx, 2)
+	logger = logger.With("attempt", tracing.Attempt(ctx))
+	logger.Debug("Retrying address resolution with fallback IP protocol", "target", target, "ip_protocol", fallbackProtocol)
 	if fallbackProtocol == "ip4" {
 		probeIPProtocolGauge.Set(4)
 	} else {

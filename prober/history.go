@@ -24,6 +24,9 @@ type Result struct {
 	Target      string
 	DebugOutput string
 	Success     bool
+	// OperationID correlates the result with the logs and metrics emitted by
+	// the same probe operation. It is empty for unsampled operations.
+	OperationID string
 }
 
 // ResultHistory contains two history slices: `results` contains most recent `maxResults` results.
@@ -37,8 +40,15 @@ type ResultHistory struct {
 	MaxResults             uint
 }
 
-// Add a result to the history.
+// Add a result to the history. The result is stored without an operation ID;
+// use AddWithOperationID to correlate the result with a specific operation.
 func (rh *ResultHistory) Add(moduleName, target, debugOutput string, success bool) {
+	rh.AddWithOperationID(moduleName, target, debugOutput, success, "")
+}
+
+// AddWithOperationID adds a result to the history, recording the operation ID
+// of the probe that produced it.
+func (rh *ResultHistory) AddWithOperationID(moduleName, target, debugOutput string, success bool, operationID string) {
 	rh.mu.Lock()
 	defer rh.mu.Unlock()
 
@@ -48,6 +58,7 @@ func (rh *ResultHistory) Add(moduleName, target, debugOutput string, success boo
 		Target:      target,
 		DebugOutput: debugOutput,
 		Success:     success,
+		OperationID: operationID,
 	}
 	rh.nextID++
 

@@ -14,9 +14,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html"
+	"log/slog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -44,6 +46,7 @@ import (
 
 	"github.com/prometheus/blackbox_exporter/config"
 	"github.com/prometheus/blackbox_exporter/prober"
+	"github.com/prometheus/blackbox_exporter/tracing"
 )
 
 var (
@@ -56,6 +59,7 @@ var (
 	enableAutoReload   = kingpin.Flag("config.enable-auto-reload", "When enabled, Blackbox exporter will automatically reload its configuration file at a specified interval. The interval is defined by the `--config.auto-reload-interval` flag, which defaults to `30s`").Default().Bool()
 	autoReloadInterval = kingpin.Flag("config.auto-reload-interval", "Specifies the interval in seconds for checking and automatically reloading configuration file upon detecting changes.").Default("30").Uint()
 	historyLimit       = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
+	tracingSamplingRate = kingpin.Flag("tracing.sampling-rate", "Fraction of operations whose operation ID is emitted on logs and metrics, between 0.0 and 1.0. The decision is deterministic per operation ID and stable across retries and asynchronous continuations. Sampling never changes probe results.").Default("1.0").Float64()
 	externalURL        = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
 	routePrefix        = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
 	toolkitFlags       = webflag.AddFlags(kingpin.CommandLine, ":9115")
@@ -81,6 +85,7 @@ func run() int {
 	kingpin.Version(version.Print("blackbox_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
+	tracing.SetDefaultSampler(tracing.NewRatioSampler(*tracingSamplingRate))
 	logger := promslog.New(promslogConfig)
 	rh := &prober.ResultHistory{MaxResults: *historyLimit}
 
@@ -99,8 +104,8 @@ func run() int {
 	logger.Info("Starting blackbox_exporter", "version", version.Info())
 	logger.Info(version.BuildContext())
 
-	if err := sc.ReloadConfig(*configFile, logger); err != nil {
-		logger.Error("Error loading config", "err", err)
+	startCtx, _ := tracing.Start(context.Background(), "")
+	if err := reloadConfig(startCtx, sc, *configFile, logger); err != nil {
 		return 1
 	}
 
@@ -141,34 +146,28 @@ func run() int {
 	logger.Debug(*routePrefix)
 
 	hup := make(chan os.Signal, 1)
-	reloadCh := make(chan chan error)
+	reloadCh := make(chan reloadRequest)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for {
 			select {
 			case <-hup:
-				if err := sc.ReloadConfig(*configFile, logger); err != nil {
-					logger.Error("Error reloading config", "err", err)
-					continue
-				}
-				logger.Info("Reloaded config file")
-			case rc := <-reloadCh:
-				if err := sc.ReloadConfig(*configFile, logger); err != nil {
-					logger.Error("Error reloading config", "err", err)
-					rc <- err
-				} else {
-					logger.Info("Reloaded config file")
-					rc <- nil
-				}
+				// Signal-initiated reload starts its own operation.
+				ctx, _ := tracing.Start(context.Background(), "")
+				_ = reloadConfig(ctx, sc, *configFile, logger)
+			case req := <-reloadCh:
+				// HTTP-initiated reload continues the handler's operation;
+				// the request context is detached inside handleReloadRequest.
+				// The buffered response channel guarantees the goroutine is
+				// not stuck even if the HTTP client went away.
+				req.rc <- handleReloadRequest(req, sc, *configFile, logger)
 			case <-time.Tick(time.Duration(*autoReloadInterval) * time.Second):
 				if !*enableAutoReload {
 					continue
 				}
-				if err := sc.ReloadConfig(*configFile, logger); err != nil {
-					logger.Error("Error reloading config", "err", err)
-					continue
-				}
-				logger.Info("Reloaded config file")
+				// Periodic reload starts its own operation.
+				ctx, _ := tracing.Start(context.Background(), "")
+				_ = reloadConfig(ctx, sc, *configFile, logger)
 			}
 		}
 	}()
@@ -193,8 +192,13 @@ func run() int {
 				return
 			}
 
-			rc := make(chan error)
-			reloadCh <- rc
+			// Continue an inbound operation if the caller supplied an ID,
+			// otherwise start a new one. The operation context travels
+			// through the channel to the background goroutine that performs
+			// the reload, where it is detached from request cancellation.
+			ctx, _ := tracing.Start(r.Context(), r.Header.Get(tracing.HeaderOperationID))
+			rc := make(chan error, 1)
+			reloadCh <- reloadRequest{ctx: ctx, rc: rc}
 			if err := <-rc; err != nil {
 				http.Error(w, fmt.Sprintf("failed to reload config: %s", err), http.StatusInternalServerError)
 			}
@@ -311,6 +315,47 @@ func run() int {
 			return 1
 		}
 	}
+}
+
+// configReloadAttempts is the number of attempts performed when loading or
+// reloading the configuration. All attempts belong to the same operation and
+// share its operation ID.
+const configReloadAttempts = 3
+
+// reloadRequest hands an HTTP-triggered configuration reload from the
+// /-/reload handler to the background reload goroutine while carrying the
+// operation context across the goroutine boundary.
+type reloadRequest struct {
+	ctx context.Context
+	// rc is buffered so the background goroutine can deliver the result even
+	// if the HTTP client has already gone away.
+	rc chan error
+}
+
+// reloadConfig loads or reloads the configuration, retrying transient
+// failures. Every retry runs under the same operation ID and sampling
+// decision carried by ctx; the 1-based attempt number is attached to the
+// logs of each attempt. Sampling affects logging only and never changes the
+// reload outcome.
+func reloadConfig(ctx context.Context, safeConfig *config.SafeConfig, configFile string, logger *slog.Logger) error {
+	return tracing.Retry(ctx, configReloadAttempts, func(ctx context.Context, attempt int) error {
+		attemptLogger := tracing.LoggerWithOperation(ctx, logger).With(tracing.LogKeyAttempt, attempt)
+		if err := safeConfig.ReloadConfig(configFile, attemptLogger); err != nil {
+			attemptLogger.Error("Error reloading config", "err", err)
+			return err
+		}
+		attemptLogger.Info("Reloaded config file")
+		return nil
+	})
+}
+
+// handleReloadRequest performs a reload handed off from the /-/reload
+// handler. The HTTP request context is detached so that a client
+// disconnect neither cancels nor delays the reload, while the operation ID
+// started by the handler (possibly continued from an inbound X-Operation-Id
+// header) is preserved on the background goroutine and its retries.
+func handleReloadRequest(req reloadRequest, safeConfig *config.SafeConfig, configFile string, logger *slog.Logger) error {
+	return reloadConfig(tracing.Detach(req.ctx), safeConfig, configFile, logger)
 }
 
 func startsOrEndsWithQuote(s string) bool {

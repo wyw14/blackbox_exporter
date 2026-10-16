@@ -32,6 +32,7 @@ import (
 	"go.yaml.in/yaml/v2"
 
 	"github.com/prometheus/blackbox_exporter/config"
+	"github.com/prometheus/blackbox_exporter/tracing"
 )
 
 var Probers = map[string]ProbeFn{
@@ -73,6 +74,10 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds*float64(time.Second)))
 	defer cancel()
+	// Start (or continue) the operation bound to this scrape. The operation
+	// ID is propagated through ctx and the logger into every prober module
+	// and their synchronous, asynchronous and retry continuations.
+	ctx, operation := tracing.Start(ctx, r.Header.Get(tracing.HeaderOperationID))
 	r = r.WithContext(ctx)
 
 	probeSuccessGauge := prometheus.NewGauge(prometheus.GaugeOpts{
@@ -121,6 +126,10 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 
 	sl := newScrapeLogger(promslogConfig, moduleName, target)
 	slLogger := slog.New(sl)
+	// Correlate every log line of this scrape (including those emitted deep
+	// inside prober modules) with the operation ID. The attribute is only
+	// added for sampled operations.
+	slLogger = tracing.LoggerWithOperation(ctx, slLogger)
 
 	slLogger.Debug("Beginning probe", "probe", module.Prober, "timeout_seconds", timeoutSeconds)
 
@@ -129,6 +138,11 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	registry.MustRegister(probeSuccessGauge)
 	registry.MustRegister(probeDurationGauge)
 	registry.MustRegister(probeTimeoutGauge)
+	// Expose the operation ID alongside the probe metrics so that the scraped
+	// metrics can be aggregated with the correlated logs. No metric is
+	// registered for unsampled operations, and this never affects the probe
+	// result.
+	tracing.RegisterOperationMetric(ctx, registry)
 	success := prober(ctx, target, module, registry, slLogger)
 	duration := time.Since(start).Seconds()
 	probeDurationGauge.Set(duration)
@@ -141,7 +155,11 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	}
 
 	debugOutput := DebugOutput(&module, sl.buffer, registry)
-	rh.Add(moduleName, target, debugOutput, success)
+	operationID := ""
+	if operation.Sampled {
+		operationID = operation.ID
+	}
+	rh.AddWithOperationID(moduleName, target, debugOutput, success, operationID)
 
 	if r.URL.Query().Get("debug") == "true" {
 		w.Header().Set("Content-Type", "text/plain")
